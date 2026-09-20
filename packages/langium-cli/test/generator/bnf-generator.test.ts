@@ -27,7 +27,7 @@ describe('BNF generator', () => {
         const generated = generateBnf([result.value]);
         const expected = expandToStringWithNL`
         # * This is a root rule
-        root ::= package-declaration*
+        root ::= package-declaration* hidden*
 
         # * This is a package declaration * Using parser rule fragment
         package-declaration ::= hidden* "package" named-element hidden* "{" hidden* "}"
@@ -37,15 +37,15 @@ describe('BNF generator', () => {
         qualified-name ::= id ( hidden* "." id )*
 
         # * Terminal fragment
-        number ::= hidden* [0-9]+
+        number ::= [0-9]+
 
         # * Terminal using fragment
-        signed-number ::= hidden* [+-] number+
+        signed-number ::= hidden* [+\\-] number+
 
         # Terminal rule
         id ::= hidden* [A-z]*
 
-        ws ::= \\s+
+        ws ::= [\\t-\\r \\xA0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\uFEFF]+
 
         hidden ::= ( ws )
         `;
@@ -57,7 +57,7 @@ describe('BNF generator', () => {
         const generated = generateBnf([result.value], { dialect: 'EBNF' });
         const expected = expandToStringWithNL`
         (* * This is a root rule *)
-        <Domainmodel> ::= <PackageDeclaration>*
+        <Domainmodel> ::= <PackageDeclaration>* <HIDDEN>*
 
         (* * This is a package declaration * Using parser rule fragment *)
         <PackageDeclaration> ::= <HIDDEN>* "package" <NamedElement> <HIDDEN>* "{" <HIDDEN>* "}"
@@ -67,15 +67,15 @@ describe('BNF generator', () => {
         <QualifiedName> ::= <ID> ( <HIDDEN>* "." <ID> )*
 
         (* * Terminal fragment *)
-        <NUMBER> ::= <HIDDEN>* [0-9]+
+        <NUMBER> ::= [0-9]+
 
         (* * Terminal using fragment *)
-        <SIGNED_NUMBER> ::= <HIDDEN>* [+-] <NUMBER>+
+        <SIGNED_NUMBER> ::= <HIDDEN>* [+\\-] <NUMBER>+
 
         (* Terminal rule *)
         <ID> ::= <HIDDEN>* [A-z]*
 
-        <WS> ::= \\s+
+        <WS> ::= [\\t-\\r \\xA0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\uFEFF]+
 
         <HIDDEN> ::= ( <WS> )
         `;
@@ -95,7 +95,7 @@ describe('BNF generator', () => {
         const expected = expandToStringWithNL`
         root ::= "root" id
 
-        id ::= [_a-zA-Z][\\w_]*
+        id ::= [A-Z_a-z] [0-9A-Z_a-z]*
 
         `;
         expect(generated).toBe(expected);
@@ -113,7 +113,7 @@ describe('BNF generator', () => {
         const expected = expandToStringWithNL`
         root ::= "root" id
 
-        id ::= [_a-zA-Z][\\w_]*
+        id ::= [A-Z_a-z] [0-9A-Z_a-z]*
 
         `;
         expect(generated).toBe(expected);
@@ -136,7 +136,7 @@ describe('BNF generator', () => {
         <Root> ::= "root" <ID>
 
         /* This is a terminal rule */
-        <ID> ::= [_a-zA-Z][\\w_]*
+        <ID> ::= [A-Z_a-z] [0-9A-Z_a-z]*
 
         `;
         expect(generated).toBe(expected);
@@ -158,15 +158,15 @@ describe('BNF generator', () => {
         const result = await parseGrammar(grammarContent);
         const generated = generateBnf([result.value]);
         const expected = expandToStringWithNL`
-        root ::= hidden* "root" id
+        root ::= hidden* "root" id hidden*
 
-        id ::= hidden* [_a-zA-Z][\\w_]*
+        id ::= hidden* [A-Z_a-z] [0-9A-Z_a-z]*
 
-        number ::= hidden* ([0-9]+ | [0-9]+(\\.[0-9]*))
+        number ::= hidden* ([0-9]+ | [0-9]+ ("." [0-9]*))
 
-        ml-comment ::= /\\*[\\s\\S]*?\\*/
+        ml-comment ::= "/*" .* "*/"
 
-        sl-comment ::= //[^\\n\\r]*
+        sl-comment ::= "//" [^\\n\\r]*
 
         hidden ::= ( ml-comment | sl-comment )
         `;
@@ -208,10 +208,215 @@ describe('BNF generator', () => {
         expect(generated).toBe(expected);
     });
 
+    test('Rule names are unique', async () => {
+        const grammarContent = expandToStringWithNL`
+        grammar Test
+        entry Model: values+=StringLiteral* hidden=Hidden?;
+        StringLiteral: value=STRING_LITERAL;
+        Hidden: 'hidden' Root;
+        Root: 'root';
+        terminal STRING_LITERAL: /"[^"]*"/;
+        hidden terminal WS: /[ ]+/;
+        `;
+
+        const result = await parseGrammar(grammarContent);
+        const generated = generateBnf([result.value]);
+        const expected = expandToStringWithNL`
+        root ::= string-literal* hidden-2? hidden*
+
+        string-literal ::= string-literal-token
+
+        hidden-2 ::= hidden* "hidden" root-2
+
+        root-2 ::= hidden* "root"
+
+        string-literal-token ::= hidden* "\\"" [^"]* "\\""
+
+        ws ::= [ ]+
+
+        hidden ::= ( ws )
+        `;
+        expect(generated).toBe(expected);
+    });
+
+    test('Case insensitive keywords', async () => {
+        const grammarContent = expandToStringWithNL`
+        grammar Test
+        entry Model: 'print' value=ID 'to'? target=('file1' | '>>');
+        terminal ID: /[a-z]+/;
+        `;
+
+        const result = await parseGrammar(grammarContent);
+        const generated = generateBnf([result.value], { dialect: 'GBNF', caseInsensitive: true });
+        const expected = expandToStringWithNL`
+        root ::= [Pp][Rr][Ii][Nn][Tt] id ( [Tt][Oo] )? ([Ff][Ii][Ll][Ee]"1" | ">>")
+
+        id ::= [a-z]+
+
+        `;
+        expect(generated).toBe(expected);
+    });
+
+    test('Keywords are escaped and keep their cardinality', async () => {
+        const grammarContent = expandToStringWithNL`
+        grammar Test
+        entry Model: 'let'? quote='"' backslash='\\\\'+ ';'*;
+        hidden terminal WS: /[ ]+/;
+        `;
+
+        const result = await parseGrammar(grammarContent);
+        const generated = generateBnf([result.value]);
+        const expected = expandToStringWithNL`
+        root ::= ( hidden* "let" )? hidden* "\\"" ( hidden* "\\\\" )+ ( hidden* ";" )* hidden*
+
+        ws ::= [ ]+
+
+        hidden ::= ( ws )
+        `;
+        expect(generated).toBe(expected);
+    });
+
+    test('RegEx terminal rules are translated', async () => {
+        const grammarContent = expandToStringWithNL`
+        grammar Test
+        entry Model: values+=(COMMENT | NUMBER | ANY | NOT_WORD | HEX | LAZY | QUOTED)*;
+        terminal COMMENT: /rem(?![\\w$])[^\\n\\r]*$/i;
+        terminal NUMBER: /[0-9]+(\\.[0-9]*)?|\\.[0-9]+/;
+        terminal ANY: /<[\\s\\S]*?>|<.>/;
+        terminal NOT_WORD: /[^\\w-]\\S[\\W\\d]/;
+        terminal HEX: /\\$[0-9a-f]{2,4}\\$\\d{2}\\b/;
+        terminal LAZY: /a+?b{3,}?/;
+        terminal QUOTED: /"(\\\\.|[^"\\\\])*"|\\^\\[\\]/;
+        `;
+
+        const warnings: string[] = [];
+        const result = await parseGrammar(grammarContent);
+        const generated = generateBnf([result.value], { dialect: 'GBNF', onWarning: message => warnings.push(message) });
+        const expected = expandToStringWithNL`
+        root ::= (comment | number | any | not-word | hex | lazy | quoted)*
+
+        # The assertion (?![\\w$]) cannot be expressed in BNF and was dropped, the rule accepts more input than the regular expression.
+        comment ::= [Rr][Ee][Mm] [^\\n\\r]*
+
+        number ::= [0-9]+ ("." [0-9]*)? | "." [0-9]+
+
+        any ::= "<" .* ">" | "<" [^\\n\\r\\u2028\\u2029] ">"
+
+        not-word ::= [^\\-0-9A-Z_a-z] [^\\t-\\r \\xA0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\uFEFF] [^A-Z_a-z]
+
+        # The assertion \\b cannot be expressed in BNF and was dropped, the rule accepts more input than the regular expression.
+        hex ::= "$" [0-9a-f]{2,4} "$" [0-9]{2}
+
+        lazy ::= "a"+ "b"{3,}
+
+        quoted ::= "\\"" ("\\\\" [^\\n\\r\\u2028\\u2029] | [^"\\\\])* "\\"" | "^[]"
+
+        `;
+        expect(generated).toBe(expected);
+        expect(warnings).toHaveLength(2);
+        expect(warnings[0]).toContain('COMMENT: The assertion (?![\\w$])');
+    });
+
+    test('Terminal rules without RegEx', async () => {
+        const grammarContent = expandToStringWithNL`
+        grammar Test
+        entry Model: values+=(ARROW | LETTER | ML_COMMENT | NO_QUOTE | TWO | WORD)*;
+        terminal ARROW: '=>';
+        terminal LETTER: 'a'..'z' | 'A'..'Z';
+        terminal ML_COMMENT: '/*' -> '*/';
+        terminal NO_QUOTE: '<' !('"' | 'a'..'c')* '>';
+        terminal TWO: . . (?='x');
+        terminal WORD: LETTER+ ARROW;
+        `;
+
+        const warnings: string[] = [];
+        const result = await parseGrammar(grammarContent);
+        const generated = generateBnf([result.value], { dialect: 'GBNF', onWarning: message => warnings.push(message) });
+        const expected = expandToStringWithNL`
+        root ::= (arrow | letter | ml-comment | no-quote | two | word)*
+
+        arrow ::= "=>"
+
+        letter ::= ([a-z] | [A-Z])
+
+        ml-comment ::= "/*" .* "*/"
+
+        no-quote ::= "<" [^"a-c]* ">"
+
+        # The lookahead (?='x') cannot be expressed in BNF and was dropped, the rule accepts more input than the terminal.
+        two ::= . .
+
+        word ::= ([a-z] | [A-Z])+ "=>"
+
+        `;
+        expect(generated).toBe(expected);
+        expect(warnings).toHaveLength(1);
+    });
+
+    test('Rule overrides', async () => {
+        const grammarContent = expandToStringWithNL`
+        grammar Test
+        entry Model: 'print' value=ID? end=EOL;
+        terminal EOL: /_eol_/;
+        terminal ID: /_id_/;
+        hidden terminal WS: /\\s+/;
+        `;
+
+        const result = await parseGrammar(grammarContent);
+        const generated = generateBnf([result.value], {
+            dialect: 'GBNF',
+            overrides: {
+                EOL: /;|\r?\n/,
+                ID: '[a-z]+ # custom',
+                WS: /[ \t]+/
+            }
+        });
+        const expected = expandToStringWithNL`
+        root ::= hidden* "print" id? eol hidden*
+
+        eol ::= hidden* (";" | "\\r"? "\\n")
+
+        id ::= [a-z]+ # custom
+
+        ws ::= [\\t ]+
+
+        hidden ::= ( ws )
+        `;
+        expect(generated).toBe(expected);
+    });
+
+    test('Infix rule', async () => {
+        const grammarContent = expandToStringWithNL`
+        grammar Test
+        entry Model: expr=Expression;
+        infix Expression on Primary: '*' | '/' > '+' | '-';
+        Primary: value=NUMBER;
+        terminal NUMBER: /[0-9]+/;
+        hidden terminal WS: /[ ]+/;
+        `;
+
+        const result = await parseGrammar(grammarContent);
+        const generated = generateBnf([result.value]);
+        const expected = expandToStringWithNL`
+        root ::= expression hidden*
+
+        expression ::= primary ( (hidden* "*" | hidden* "/" | hidden* "+" | hidden* "-") primary )*
+
+        primary ::= number
+
+        number ::= hidden* [0-9]+
+
+        ws ::= [ ]+
+
+        hidden ::= ( ws )
+        `;
+        expect(generated).toBe(expected);
+    });
+
 });
 
 const EXPECTED_BNF = expandToStringWithNL`
-root ::= hidden* "module" id statement*
+root ::= hidden* "module" id statement* hidden*
 
 statement ::= (definition | evaluation)
 
@@ -227,17 +432,17 @@ addition ::= multiplication ( (hidden* "+" | hidden* "-") multiplication )*
 
 multiplication ::= primary-expression ( (hidden* "*" | hidden* "/") primary-expression )*
 
-primary-expression ::= (hidden* "(" expression hidden* ")" | number | ID ( hidden* "(" expression ( hidden* "," expression )* hidden* ")" )?)
+primary-expression ::= (hidden* "(" expression hidden* ")" | number | id ( hidden* "(" expression ( hidden* "," expression )* hidden* ")" )?)
 
-ws ::= \\s+
+ws ::= [\\t-\\r \\xA0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\uFEFF]+
 
-id ::= hidden* [_a-zA-Z][\\w_]*
+id ::= hidden* [A-Z_a-z] [0-9A-Z_a-z]*
 
-number ::= hidden* [0-9]+(\\.[0-9]*)?
+number ::= hidden* [0-9]+ ("." [0-9]*)?
 
-ml-comment ::= /\\*[\\s\\S]*?\\*/
+ml-comment ::= "/*" .* "*/"
 
-sl-comment ::= //[^\\n\\r]*
+sl-comment ::= "//" [^\\n\\r]*
 
 hidden ::= ( ws | ml-comment | sl-comment )
 `;

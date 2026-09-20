@@ -160,7 +160,7 @@
                             }
                         },
                         "dialect": {
-                            "description": "Dialect of the generated BNF file. GBNF is the default. In EBNF RegEx terminals are not supported.",
+                            "description": "Dialect of the generated BNF file. GBNF is the default. RegEx terminals are translated, except for lookaround assertions, which BNF cannot express.",
                             "type": {
                                 "enum": [
                                     "GBNF", "EBNF"

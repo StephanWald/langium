@@ -77,7 +77,7 @@ export interface LangiumLanguageConfig {
     bnf?: {
         /** Output path for the BNF file */
         out: string,
-        /** Dialect of the generated BNF file. GBNF is the default. In EBNF RegEx terminals are not supported. */
+        /** Dialect of the generated BNF file. GBNF is the default. RegEx terminals are translated, except for lookaround assertions, which BNF cannot express. */
         dialect?: 'GBNF' | 'EBNF',
         /**
          * By default, comments are generated according to the dialect. GBNF uses `#`, EBNF uses `(* *)`.

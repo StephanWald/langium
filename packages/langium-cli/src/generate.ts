@@ -405,7 +405,9 @@ export async function runGenerator(config: LangiumConfig, options: GenerateOptio
         if (languageConfig?.bnf) {
             const genBnf = generateBnf([grammar], {
                 dialect: languageConfig.bnf.dialect ?? 'GBNF',
-                commentStyle: languageConfig.bnf.comment
+                commentStyle: languageConfig.bnf.comment,
+                caseInsensitive: languageConfig.caseInsensitive,
+                onWarning: message => log('warn', options, chalk.yellow(`BNF generator: ${message}`))
             });
             const bnfPath = path.resolve(relPath, languageConfig.bnf.out ?? `${grammar.name ?? 'grammar'}.gbnf`);
             log('log', options, `Writing BNF grammar to ${chalk.white.bold(bnfPath)}`);

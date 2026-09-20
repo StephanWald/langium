@@ -7,139 +7,284 @@
 import { CstUtils, GrammarAST as ast, type Grammar } from 'langium';
 import { EOL } from 'langium/generate';
 import _ from 'lodash';
+import { characterClassToBnf, literalToBnf, regexToBnf, toAtom, withCardinality, type BnfFragment } from './bnf-regexp.js';
+
+/** Key of the generated rule that collects the hidden terminal rules. It can't collide with the name of a grammar rule. */
+const HIDDEN = '<HIDDEN>';
+const EMPTY: BnfFragment = { text: '', kind: 'sequence' };
+const ANY_CHARACTER: BnfFragment = { text: '.', kind: 'atom' };
 
 export function generateBnf(grammars: Grammar[], options: GeneratorOptions = { dialect: 'GBNF' }): string {
     const grammarsWithName = grammars.filter(grammar => !!grammar.name);
+    const rules = grammarsWithName.flatMap(grammar => grammar.rules);
 
     const isHiddenTerminalRule = (rule: ast.AbstractRule): boolean => {
         return ast.isTerminalRule(rule) && rule.hidden;
     };
+    const hiddenRules = rules.filter(isHiddenTerminalRule);
 
     const ctx: GeneratorContext = {
-        rootAssigned: options.dialect === 'EBNF',
-        hasHiddenRules: grammarsWithName.some(grammar => grammar.rules.some(isHiddenTerminalRule)),
-        dialect: options.dialect,
-        commentStyle: options.commentStyle ?? (options.dialect === 'GBNF' ? 'hash' : 'parentheses')
+        ...options,
+        hasHiddenRules: hiddenRules.length > 0,
+        commentStyle: options.commentStyle ?? (options.dialect === 'GBNF' ? 'hash' : 'parentheses'),
+        entryRule: rules.find(rule => ast.isParserRule(rule) && rule.entry),
+        names: new Map(),
+        notes: [],
+        onWarning: options.onWarning ?? (message => console.warn(message))
     };
-
-    const hiddenRules: ast.AbstractRule[] = [];
+    assignNames(rules, ctx);
 
     let result: string = '';
-    grammarsWithName.forEach(grammar => {
-        grammar.rules.forEach(rule => {
-            result += processRule(rule, ctx);
-            result += EOL + EOL;
-            if (isHiddenTerminalRule(rule)) {
-                hiddenRules.push(rule);
-            }
-        });
+    rules.forEach(rule => {
+        result += processRule(rule, ctx);
+        result += EOL + EOL;
     });
 
     if (hiddenRules.length > 0) {
-        result += `${processName('HIDDEN', ctx)} ::= ( ${hiddenRules.map(rule => processName(rule.name, ctx)).join(' | ')} )${EOL}`;
+        result += `${processName(HIDDEN, ctx)} ::= ( ${hiddenRules.map(rule => processName(rule.name, ctx)).join(' | ')} )${EOL}`;
     }
     return result;
 }
 
 function processRule(rule: ast.AbstractRule, ctx: GeneratorContext): string {
-    const markRoot = !ctx.rootAssigned && ast.isParserRule(rule) && rule.entry;
-    if (markRoot) {
-        ctx.rootAssigned = true;
-    }
-
-    // GBNF expects 'root' as the root rule name, Lark e.g. expects 'start'.
     const ruleComment = processComment(rule, ctx);
-    const hiddenPrefix = (ast.isTerminalRule(rule) && !rule.hidden) ? hiddenRuleCall(ctx) : '';
-    const ruleName = markRoot ? 'root' : rule.name;
-    if (ast.isParserRule(rule) && rule.parameters.length > 0) {
+    if (ast.isParserRule(rule) && rule.parameters.length > 0 && !hasOverride(rule, ctx)) {
         // parser rule with parameters
         const variations: Array<Record<string, boolean>> = parserRuleVariations(rule.parameters);
-        let content = '';
-        variations.forEach((variation, idx) => {
+        return variations.map(variation => {
             const variationCtx = { ...ctx, parserRuleVariation: variation };
-            content += `${ruleComment}${processName(ruleName, variationCtx, variation)} ::= ${hiddenPrefix}${processElement(rule.definition, variationCtx)}`;
-            if (idx < variations.length - 1) {
-                content += EOL;
-            }
-        });
-        return content;
+            return processRuleVariation(rule, ruleComment, variationCtx, variation);
+        }).join(EOL);
     }
-    if (ast.isInfixRule(rule)) {
-        return `${ruleComment}${processName(ruleName, ctx)} ::= ${hiddenPrefix}${processInfix(rule, ctx)}`;
-    } else {
-        return `${ruleComment}${processName(ruleName, ctx)} ::= ${hiddenPrefix}${processElement(rule.definition, ctx)}`;
-    }
+    return processRuleVariation(rule, ruleComment, ctx);
 }
 
-function processInfix(rule: ast.InfixRule, ctx: GeneratorContext): string {
-    const infixRuleName = processName(rule.name, ctx);
+function processRuleVariation(rule: ast.AbstractRule, ruleComment: string, ctx: GeneratorContext, variation?: Record<string, boolean>): string {
+    ctx.notes.length = 0;
+    ctx.currentRule = rule;
+    const body = processRuleBody(rule, ctx);
+    const notes = ctx.commentStyle === 'skip' ? '' : ctx.notes.map(note => formatComment(note, ctx)).join('');
+    return `${ruleComment}${notes}${processName(rule.name, ctx, variation)} ::= ${body}`;
+}
+
+function processRuleBody(rule: ast.AbstractRule, ctx: GeneratorContext): string {
+    const override = ctx.overrides?.[rule.name];
+    if (typeof override === 'string') {
+        return override;
+    }
+    let body: BnfFragment;
+    if (override) {
+        body = regexToBnf(override, { onWarning: message => warn(message, ctx) });
+    } else if (ast.isInfixRule(rule)) {
+        body = processInfix(rule, ctx);
+    } else {
+        body = processElement(rule.definition, ctx);
+    }
+    // GBNF doesn't know hidden tokens, so they are accepted in front of each token and at the end of the input.
+    const hiddenPrefix = (ast.isTerminalRule(rule) && !rule.hidden && !rule.fragment) ? hiddenRuleCall(ctx) : '';
+    const hiddenSuffix = (rule === ctx.entryRule && ctx.hasHiddenRules) ? ` ${processName(HIDDEN, ctx)}*` : '';
+    if (hiddenPrefix.length > 0 || hiddenSuffix.length > 0) {
+        return `${hiddenPrefix}${sequenceMember(body)}${hiddenSuffix}`;
+    }
+    return body.text;
+}
+
+function hasOverride(rule: ast.AbstractRule, ctx: GeneratorContext): boolean {
+    return ctx.overrides?.[rule.name] !== undefined;
+}
+
+function processInfix(rule: ast.InfixRule, ctx: GeneratorContext): BnfFragment {
     const variation = collectArguments(rule.call.rule.ref, rule.call.arguments, ctx);
     const ruleName = rule.call.rule.ref?.name ?? rule.call.rule.$refText;
     const call = processName(ruleName, ctx, variation);
-    const operators = rule.operators.precedences.flatMap(prec => prec.operators.map(op => `"${op.value}"`));
+    const operators = rule.operators.precedences.flatMap(prec => prec.operators.map(op => processKeyword(op.value, ctx).text));
     const allOperators = `(${operators.join(' | ')})`;
-    return `${infixRuleName} ::= ${call} (${allOperators} ${call})*`;
+    return { text: `${call} ( ${allOperators} ${call} )*`, kind: 'sequence' };
 }
 
-function processElement(element: ast.AbstractElement, ctx: GeneratorContext): string {
+function processElement(element: ast.AbstractElement, ctx: GeneratorContext): BnfFragment {
+    if (ast.isTerminalElement(element) && element.lookahead) {
+        warn(`The lookahead ${element.$cstNode?.text ?? element.lookahead} cannot be expressed in BNF and was dropped, the rule accepts more input than the terminal.`, ctx);
+        return EMPTY;
+    }
+    const fragment = processElementContent(element, ctx);
+    return element.cardinality ? withCardinality(fragment, element.cardinality, ' ') : fragment;
+}
+
+function processElementContent(element: ast.AbstractElement, ctx: GeneratorContext): BnfFragment {
     const processRecursively = (element: ast.AbstractElement) => {
         return processElement(element, ctx);
     };
     if (ast.isKeyword(element)) {
-        return `${hiddenRuleCall(ctx)}"${element.value}"`;
+        return processKeyword(element.value, ctx);
     } else if (ast.isGroup(element) || ast.isTerminalGroup(element)) {
         if (ast.isGroup(element) && element.guardCondition && !evaluateCondition(element.guardCondition, ctx)) {
             // Skip group if guard condition is false
-            return ' ';
+            return EMPTY;
         }
-        const content = element.elements.map(processRecursively).filter(notEmpty).join(' ');
-        if (element.cardinality && notEmpty(content)) {
-            return `( ${content} )${processCardinality(element)}`;
+        const content = element.elements.map(processRecursively).filter(fragment => notEmpty(fragment.text));
+        if (content.length === 1) {
+            return content[0];
         }
-        return content;
+        return { text: content.map(sequenceMember).join(' '), kind: 'sequence' };
     } else if (ast.isAssignment(element)) {
-        return processRecursively(element.terminal) + processCardinality(element);
-    } else if (ast.isRuleCall(element) || ast.isTerminalRuleCall(element)) {
-        const variation = ast.isRuleCall(element) ? collectArguments(element.rule.ref, element.arguments, ctx) : undefined;
+        return processRecursively(element.terminal);
+    } else if (ast.isRuleCall(element)) {
+        const variation = collectArguments(element.rule.ref, element.arguments, ctx);
         const ruleName = element.rule.ref?.name ?? element.rule.$refText;
-        return processName(ruleName, ctx, variation) + processCardinality(element);
-    } else if (ast.isAlternatives(element) || ast.isTerminalAlternatives(element)) {
-        const content = element.elements.map(processRecursively).filter(notEmpty).join(' | ');
-        if (notEmpty(content)) {
-            return '(' + content + ')' + processCardinality(element);
+        return { text: processName(ruleName, ctx, variation), kind: 'atom' };
+    } else if (ast.isTerminalRuleCall(element)) {
+        const rule = element.rule.ref;
+        if (rule && !rule.fragment && !hasOverride(rule, ctx)) {
+            // The rules of other terminals accept leading hidden tokens, so their definition is used instead.
+            return { text: toAtom(processRecursively(rule.definition)), kind: 'atom' };
         }
-        return '';
+        return { text: processName(rule?.name ?? element.rule.$refText, ctx), kind: 'atom' };
+    } else if (ast.isAlternatives(element) || ast.isTerminalAlternatives(element)) {
+        const content = element.elements.map(processRecursively).map(fragment => fragment.text).filter(notEmpty).join(' | ');
+        if (notEmpty(content)) {
+            return { text: '(' + content + ')', kind: 'atom' };
+        }
+        return EMPTY;
+    } else if (ast.isUnorderedGroup(element)) {
+        const content = element.elements.map(processRecursively).map(fragment => fragment.text).filter(notEmpty).join(' | ');
+        warn('Unordered groups are generated as repeated alternatives, the rule accepts the elements multiple times.', ctx);
+        return notEmpty(content) ? { text: `(${content})*`, kind: 'atom' } : EMPTY;
     } else if (ast.isRegexToken(element)) {
-        // First remove trailing and leading slashes. Replace escaped slashes `\/` with unescaped slashes `/`.
-        return element.regex.replace(/(^|[^\\])\//g, (_, p1) => p1 + '').replace(/\\\//g, '/');
+        return regexToBnf(element.regex, { onWarning: message => warn(message, ctx) });
+    } else if (ast.isCharacterRange(element)) {
+        if (element.right) {
+            return characterClassToBnf([[element.left.value, element.right.value]]);
+        }
+        return literalToBnf(element.left.value);
+    } else if (ast.isWildcard(element)) {
+        return ANY_CHARACTER;
+    } else if (ast.isNegatedToken(element)) {
+        const characters = collectCharacters(element.terminal);
+        if (characters) {
+            return characterClassToBnf(characters, true);
+        }
+        warn(`The negated token ${element.$cstNode?.text ?? ''} cannot be expressed in BNF and was replaced by a wildcard, the rule accepts more input than the terminal.`, ctx);
+        return ANY_CHARACTER;
+    } else if (ast.isUntilToken(element)) {
+        // The terminal ends at the first match of the end token, the generated rule accepts further matches in between.
+        return { text: `${ANY_CHARACTER.text}* ${toAtom(processRecursively(element.terminal))}`, kind: 'sequence' };
     } else if (ast.isCrossReference(element)) {
-        return (element.terminal ? processRecursively(element.terminal) : 'ID') + processCardinality(element);
-    } else if (ast.isAction(element)) {
-        return '';
+        return element.terminal ? processRecursively(element.terminal) : { text: processName('ID', ctx), kind: 'atom' };
+    } else if (ast.isAction(element) || ast.isEndOfFile(element)) {
+        return EMPTY;
     }
-    console.error(`Not handled AbstractElement type: ${element?.$type}`);
-    return `not-handled-(${element?.$type})`;
+    warn(`Not handled AbstractElement type: ${element?.$type}`, ctx);
+    return EMPTY;
 }
 
-function processCardinality(element: ast.AbstractElement): string {
-    return element.cardinality ?? '';
+function processKeyword(value: string, ctx: GeneratorContext): BnfFragment {
+    const keyword = literalToBnf(value, ctx.caseInsensitive);
+    const hiddenPrefix = hiddenRuleCall(ctx);
+    return hiddenPrefix.length > 0 ? { text: hiddenPrefix + keyword.text, kind: 'sequence' } : keyword;
 }
 
-function processName(ruleName: string, ctx: GeneratorContext, parserRuleVariation?: Record<string, boolean>): string {
-    const name = parserRuleVariation
-        ? `${ruleName}${Object.entries(parserRuleVariation)
-            .filter(entry => entry[1]).map(entry => entry[0].charAt(0).toUpperCase() + entry[0].slice(1))
-            .join('')}`
-        : ruleName;
+/**
+ * Collects the characters of an element matching a single character, i.e. a character, a character range or alternatives of those.
+ */
+function collectCharacters(element: ast.AbstractElement): Array<[string, string]> | undefined {
+    if (element.cardinality) {
+        return undefined;
+    } else if (ast.isCharacterRange(element)) {
+        if (element.right) {
+            return [[element.left.value, element.right.value]];
+        }
+        return [...element.left.value].length === 1 ? [[element.left.value, element.left.value]] : undefined;
+    } else if (ast.isTerminalAlternatives(element)) {
+        const characters = element.elements.map(collectCharacters);
+        return characters.every(entry => entry !== undefined) ? characters.flat() : undefined;
+    }
+    return undefined;
+}
+
+/**
+ * Alternatives need to be parenthesized within a sequence.
+ */
+function sequenceMember(fragment: BnfFragment): string {
+    return fragment.kind === 'alternatives' ? `(${fragment.text})` : fragment.text;
+}
+
+function warn(message: string, ctx: GeneratorContext): void {
+    ctx.notes.push(message);
+    ctx.onWarning(ctx.currentRule ? `${ctx.currentRule.name}: ${message}` : message);
+}
+
+/**
+ * Assigns a unique name to each rule. GBNF rule names are dashed lowercase words, so different rule names
+ * of the grammar like `StringLiteral` and `STRING_LITERAL` may result in the same name.
+ */
+function assignNames(rules: ast.AbstractRule[], ctx: GeneratorContext): void {
+    const used = new Set<string>();
+    const assign = (key: string, name: string, isTerminal = false) => {
+        let formatted = formatName(name, ctx);
+        if (isTerminal && used.has(formatted)) {
+            formatted = formatName(`${name}_TOKEN`, ctx);
+        }
+        for (let index = 2; used.has(formatted); index++) {
+            formatted = formatName(`${name}_${index}`, ctx);
+        }
+        used.add(formatted);
+        ctx.names.set(key, formatted);
+    };
+    // GBNF expects 'root' as the root rule name, Lark e.g. expects 'start'.
+    if (ctx.dialect === 'GBNF' && ctx.entryRule) {
+        used.add('root');
+        ctx.names.set(nameKey(ctx.entryRule.name), 'root');
+    }
+    if (ctx.hasHiddenRules) {
+        assign(HIDDEN, 'HIDDEN');
+    }
+    // The names of parser rules take precedence over the names of terminal rules
+    const terminalRules = rules.filter(ast.isTerminalRule);
+    for (const rule of rules.filter(rule => !ast.isTerminalRule(rule))) {
+        if (ast.isParserRule(rule) && rule.parameters.length > 0) {
+            for (const variation of parserRuleVariations(rule.parameters)) {
+                const key = nameKey(rule.name, variation);
+                if (!ctx.names.has(key)) {
+                    assign(key, rule.name + variationSuffix(variation));
+                }
+            }
+        }
+        if (!ctx.names.has(nameKey(rule.name))) {
+            assign(nameKey(rule.name), rule.name);
+        }
+    }
+    for (const rule of terminalRules) {
+        assign(nameKey(rule.name), rule.name, true);
+    }
+}
+
+function nameKey(ruleName: string, parserRuleVariation?: Record<string, boolean>): string {
+    const suffix = parserRuleVariation ? variationSuffix(parserRuleVariation) : '';
+    return suffix.length > 0 ? `${ruleName}<${suffix}>` : ruleName;
+}
+
+function variationSuffix(parserRuleVariation: Record<string, boolean>): string {
+    return Object.entries(parserRuleVariation)
+        .filter(entry => entry[1]).map(entry => entry[0].charAt(0).toUpperCase() + entry[0].slice(1))
+        .join('');
+}
+
+function formatName(name: string, ctx: GeneratorContext): string {
     switch (ctx.dialect) {
         case 'GBNF':
             // convert camel case to Kebab Case for GBNF (GGML AI)
-            return _.kebabCase(name);
+            return _.kebabCase(name) || 'rule';
         case 'EBNF':
             return `<${name}>`;
         default:
             return name;
     }
+}
+
+function processName(ruleName: string, ctx: GeneratorContext, parserRuleVariation?: Record<string, boolean>): string {
+    return ctx.names.get(nameKey(ruleName, parserRuleVariation))
+        ?? formatName(ruleName + (parserRuleVariation ? variationSuffix(parserRuleVariation) : ''), ctx);
 }
 
 function processComment(rule: ast.AbstractRule, ctx: GeneratorContext) {
@@ -148,18 +293,22 @@ function processComment(rule: ast.AbstractRule, ctx: GeneratorContext) {
         ?.replace(/^\/\*\s*/, '')   // Remove leading `/*`
         ?.replace(/\s*\*\/$/, '');  // Remove trailing `*/`
     if (comment && comment.trim().length > 0) {
-        switch (ctx.commentStyle) {
-            case 'skip':
-                return ' ';
-            case 'parentheses':
-                return `(* ${comment} *)${EOL}`;
-            case 'slash':
-                return `/* ${comment} */${EOL}`;
-            case 'hash':
-                return `# ${comment}${EOL}`;
-        }
+        return formatComment(comment, ctx);
     }
     return '';
+}
+
+function formatComment(comment: string, ctx: GeneratorContext): string {
+    switch (ctx.commentStyle) {
+        case 'skip':
+            return ' ';
+        case 'parentheses':
+            return `(* ${comment.replace(/\*\)/g, '* )')} *)${EOL}`;
+        case 'slash':
+            return `/* ${comment.replace(/\*\//g, '* /')} */${EOL}`;
+        case 'hash':
+            return `# ${comment}${EOL}`;
+    }
 }
 
 /**
@@ -168,7 +317,7 @@ function processComment(rule: ast.AbstractRule, ctx: GeneratorContext) {
  * @returns `HIDDEN* ` if there are hidden rules in the grammar.
  */
 function hiddenRuleCall(ctx: GeneratorContext): string {
-    return ctx.hasHiddenRules ? (processName('HIDDEN', ctx) + '* ') : '';
+    return ctx.hasHiddenRules ? (processName(HIDDEN, ctx) + '* ') : '';
 }
 
 function notEmpty(text: string): boolean {
@@ -228,7 +377,7 @@ function evaluateCondition(condition: ast.Condition, ctx: GeneratorContext): boo
 
 /**
  * Default: GBNF
- * EBNF doesn't support RegEx terminal rules.
+ * RegEx terminal rules are translated for both dialects. BNF cannot express lookaround assertions, so they are dropped with a warning.
  */
 export type BnfDialect = 'GBNF' | 'EBNF';
 
@@ -243,12 +392,33 @@ export type CommentStyle = 'skip' | 'parentheses' | 'slash' | 'hash';
 export type GeneratorOptions = {
     dialect: BnfDialect;
     commentStyle?: CommentStyle;
+    /**
+     * Matches keywords regardless of their case, like the `caseInsensitive` option of the language configuration.
+     * Neither dialect has a notion of case insensitivity, so each letter becomes a character class, e.g. `[pP][rR][iI][nN][tT]`.
+     */
+    caseInsensitive?: boolean;
+    /**
+     * Replaces the definition of rules, by the name of the rule in the grammar. This is meant for languages that replace
+     * the pattern of terminal rules in their `TokenBuilder`, so the grammar doesn't contain the actual definition.
+     * A regular expression is translated like the regular expression of a terminal rule. A string is used as it is.
+     */
+    overrides?: Record<string, RegExp | string>;
+    /**
+     * Receives a message for each element that cannot be expressed in BNF. Such elements are dropped,
+     * so the generated rule accepts more input than the rule of the grammar. By default, the messages are written to the console.
+     */
+    onWarning?: (message: string) => void;
 };
 
 type GeneratorContext = GeneratorOptions & {
-    rootAssigned: boolean;
     hasHiddenRules: boolean;
     commentStyle: CommentStyle;
+    entryRule?: ast.AbstractRule;
+    /** Names of the generated rules by the key of `nameKey()` */
+    names: Map<string, string>;
+    /** Warnings of the currently processed rule, they are added as comment to the generated rule. */
+    notes: string[];
+    currentRule?: ast.AbstractRule;
+    onWarning: (message: string) => void;
     parserRuleVariation?: Record<string, boolean>;
 };
-
